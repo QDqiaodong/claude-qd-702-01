@@ -56,9 +56,19 @@ public class CalibrationOrder {
     @Column(name = "checker", length = 32)
     private String checker;
 
-    /** 实测数据项：多条用 ; 分隔，单条为 校准点|标准值|示值|示值误差 */
+    /** 历史文本实测数据项；结构化委托只作旧记录留档，出证以固定记录版本为准 */
     @Column(name = "measured_data", length = 500)
     private String measuredData;
+
+    /** LEGACY_TEXT / STRUCTURED / LEGACY_READONLY */
+    @Column(name = "record_mode", nullable = false, length = 16)
+    private String recordMode;
+
+    @Column(name = "current_record_version_id")
+    private Long currentRecordVersionId;
+
+    @Column(name = "cert_record_version_id")
+    private Long certRecordVersionId;
 
     /** PASS 合格 / LIMITED 限用 / FAIL 不合格 */
     @Column(name = "conclusion", length = 16)

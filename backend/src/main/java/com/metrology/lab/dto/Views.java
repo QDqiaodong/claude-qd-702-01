@@ -137,7 +137,9 @@ public final class Views {
             /** 详情：当前挂接标准器的实时状态（列表接口为空，仅详情返回） */
             List<OrderDeviceView> devices,
             /** 详情：已释放的挂接历史留痕（解除/替换/回退/作废/发放） */
-            List<DeviceLinkHistoryView> deviceHistory) {
+            List<DeviceLinkHistoryView> deviceHistory,
+            /** 详情：原始记录版本、明细、事件、旧文本与当前操作人权限；列表接口为空 */
+            RecordBundleView records) {
     }
 
     /** 委托上当前挂接的标准器（状态/有效期按查询当下实时计算） */
@@ -234,6 +236,123 @@ public final class Views {
             Long orderOpen,
             Long deviceExpiring,
             BigDecimal monthFee) {
+    }
+
+    /** 原始记录明细项 */
+    public record RecordItemView(
+            Long id,
+            Integer itemNo,
+            String rowKey,
+            String calibrationPoint,
+            String standardValue,
+            String indicatedValue,
+            String errorValue,
+            String unit,
+            String remark) {
+    }
+
+    /** 原始记录版本留痕 */
+    public record RecordVersionView(
+            Long id,
+            Integer versionNo,
+            String status,
+            String statusName,
+            String source,
+            String sourceName,
+            Long sourceVersionId,
+            Integer sourceVersionNo,
+            String legacySourceText,
+            boolean legacy,
+            String verifierName,
+            String checkerName,
+            String conclusion,
+            String conclusionName,
+            String recordRemark,
+            LocalDateTime submittedAt,
+            LocalDateTime reviewedAt,
+            String rejectReason,
+            LocalDateTime createdAt,
+            LocalDateTime updatedAt,
+            LocalDateTime lockedAt,
+            boolean editable,
+            boolean locked,
+            boolean current,
+            boolean certificateVersion,
+            Integer itemCount,
+            List<RecordItemView> items,
+            /** 与上一版本逐行逐字段对比；详情的当前版本才返回，历史列表可能为空 */
+            List<RecordDiffView> changes) {
+    }
+
+    /** 版本差异：按行对齐后逐字段标识 SAME/MODIFIED/ADDED/REMOVED */
+    public record RecordDiffView(
+            Integer itemNo,
+            String changeType,
+            String changeTypeName,
+            RecordItemView before,
+            RecordItemView after,
+            List<RecordFieldDiffView> fields) {
+    }
+
+    public record RecordFieldDiffView(
+            String field,
+            String fieldName,
+            String before,
+            String after,
+            boolean changed) {
+    }
+
+    /** 原始记录事件流 */
+    public record RecordEventView(
+            Long id,
+            Long versionId,
+            Integer versionNo,
+            String eventType,
+            String eventTypeName,
+            String actorName,
+            String actorRole,
+            String actorRoleName,
+            String detail,
+            Long fromVersionId,
+            Integer fromVersionNo,
+            LocalDateTime createdAt) {
+    }
+
+    /** 当前登录操作者（演示环境由网关注入请求头；服务端做最终角色和指派校验） */
+    public record OperatorView(String name, String role, String roleName, boolean authenticated) {
+    }
+
+    /** 委托详情中的原始记录聚合视图 */
+    public record RecordBundleView(
+            String mode,
+            String modeName,
+            boolean structured,
+            boolean legacyText,
+            boolean legacyReadonly,
+            String legacyText,
+            boolean canMigrateLegacy,
+            Long draftVersionId,
+            Long currentVersionId,
+            Integer currentVersionNo,
+            Long certificateVersionId,
+            Integer certificateVersionNo,
+            String certificateDataSource,
+            String certificateDataSourceName,
+            String certificateConclusion,
+            String certificateConclusionName,
+            List<RecordItemView> certificateItems,
+            List<RecordVersionView> versions,
+            List<RecordEventView> events,
+            OperatorView operator,
+            boolean canSaveDraft,
+            boolean canSubmit,
+            boolean canReturn,
+            boolean canApprove,
+            boolean canWithdraw,
+            boolean canStartRevision,
+            boolean canAssign,
+            boolean canMigrate,
+            String actionHint) {
     }
 
     /** 模块五：标准器 */

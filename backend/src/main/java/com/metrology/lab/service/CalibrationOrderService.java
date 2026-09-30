@@ -45,6 +45,7 @@ public class CalibrationOrderService {
     private final ProcedureRepository procedureRepository;
     private final StandardDeviceRepository deviceRepository;
     private final OrderDeviceService orderDeviceService;
+    private final OriginalRecordService originalRecordService;
 
     public CalibrationOrderService(CalibrationOrderRepository orderRepository,
                                    InstrumentService instrumentService,
@@ -52,7 +53,8 @@ public class CalibrationOrderService {
                                    ClientRepository clientRepository,
                                    ProcedureRepository procedureRepository,
                                    StandardDeviceRepository deviceRepository,
-                                   OrderDeviceService orderDeviceService) {
+                                   OrderDeviceService orderDeviceService,
+                                   OriginalRecordService originalRecordService) {
         this.orderRepository = orderRepository;
         this.instrumentService = instrumentService;
         this.instrumentRepository = instrumentRepository;
@@ -60,6 +62,7 @@ public class CalibrationOrderService {
         this.procedureRepository = procedureRepository;
         this.deviceRepository = deviceRepository;
         this.orderDeviceService = orderDeviceService;
+        this.originalRecordService = originalRecordService;
     }
 
     @Transactional(readOnly = true)
@@ -170,7 +173,7 @@ public class CalibrationOrderService {
     }
 
     @Transactional(readOnly = true)
-    public Views.OrderView detail(Long id) {
+    public Views.OrderView detail(Long id, String operatorName) {
         CalibrationOrder order = require(id);
         // 详情每次都按当前时间实时判定 —— 停用、证书改期、异常记录在重新进入页面时立即可见
         OrderDeviceService.GateCheck gate = orderDeviceService.checkGate(id, false);
@@ -181,9 +184,15 @@ public class CalibrationOrderService {
                 .filter(java.util.Objects::nonNull)
                 .min(LocalDate::compareTo)
                 .orElse(null);
+        Views.RecordBundleView records = originalRecordService.bundle(order,
+                originalRecordService.operatorName(operatorName));
         return toView(order, context(),
                 new OrderDeviceService.LinkSummary(devices.size(), earliest), true,
-                gate, devices, history);
+                gate, devices, history, records);
+    }
+
+    public Views.OrderView detail(Long id) {
+        return detail(id, null);
     }
 
     // ============================ 挂接入口 ============================
@@ -254,6 +263,9 @@ public class CalibrationOrderService {
         order.setVerifier(blankToNull(req.getVerifier()));
         order.setChecker(blankToNull(req.getChecker()));
         order.setMeasuredData(blankToNull(req.getMeasuredData()));
+        order.setRecordMode(MetroDict.MODE_LEGACY_TEXT);
+        order.setCurrentRecordVersionId(null);
+        order.setCertRecordVersionId(null);
         order.setConclusion(blankToNull(req.getConclusion()));
         order.setCertNo(blankToNull(req.getCertNo()));
         order.setStatus("RECEIVED");
@@ -268,22 +280,36 @@ public class CalibrationOrderService {
         return detail(order.getId());
     }
 
-    /** 录入/修订实测数据与结论 */
+    /** 旧接口仅保留旧文本兼容与证书元数据维护；结构化数据必须走版本接口。 */
     @Transactional
     public Views.OrderView saveResult(Long id, CalibrationOrderDtos.ResultReq req) {
         CalibrationOrder order = require(id);
         if ("ISSUED".equals(order.getStatus()) || MetroDict.STATUS_VOIDED.equals(order.getStatus())) {
             throw new BizException("委托单已" + ("ISSUED".equals(order.getStatus()) ? "发放" : "作废") + "，不能再修改检定数据");
         }
-        order.setMeasuredData(blankToNull(req.getMeasuredData()));
+        if (MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())
+                && req.getMeasuredData() != null && !req.getMeasuredData().isBlank()) {
+            throw new BizException("结构化原始记录不能通过旧文本框覆盖；请在原始记录草稿中增删数据项并生成版本");
+        }
+        if (MetroDict.MODE_LEGACY_READONLY.equals(order.getRecordMode())) {
+            throw new BizException("已核验或已发放的旧文本记录只能只读保留，不能修改");
+        }
+        if (!MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())) {
+            order.setMeasuredData(blankToNull(req.getMeasuredData()));
+        }
         if (req.getConclusion() != null && !req.getConclusion().isBlank()
                 && !MetroDict.isValidConclusion(req.getConclusion())) {
             throw new BizException("检定结论只能是 PASS / LIMITED / FAIL");
         }
-        order.setConclusion(blankToNull(req.getConclusion()));
+        if (!MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())) {
+            order.setConclusion(blankToNull(req.getConclusion()));
+        }
         order.setCertNo(blankToNull(req.getCertNo()));
-        order.setVerifier(blankToNull(req.getVerifier()));
-        order.setChecker(blankToNull(req.getChecker()));
+        if (!MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())) {
+            // 结构化委托的人员指派必须走带原因留痕的 assignment 接口
+            order.setVerifier(blankToNull(req.getVerifier()));
+            order.setChecker(blankToNull(req.getChecker()));
+        }
         order.setUpdatedAt(LocalDateTime.now());
         orderRepository.save(order);
         return detail(id);
@@ -309,6 +335,9 @@ public class CalibrationOrderService {
             throw new BizException("委托单已处于「已发放」，无法继续推进");
         }
         String next = MetroDict.FLOW_ORDER.get(index + 1);
+        if ("VERIFYING".equals(next) && MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())) {
+            throw new BizException("不能直接推进到核验；请由被指派检定员在原始记录模块提交已锁定版本，由核验员确认或退回");
+        }
 
         // 关键放行点：收样→检定中必须挂接且全部合格；后续每次推进重新按当前时间复核
         OrderDeviceService.GateCheck gate = orderDeviceService.checkGate(id, "RECEIVED".equals(order.getStatus()));
@@ -317,6 +346,12 @@ public class CalibrationOrderService {
         }
 
         if ("CERTIFYING".equals(next)) {
+            if (MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())) {
+                throw new BizException("结构化记录不能直接推进到出证；须经核验员确认版本后自动进入出证");
+            }
+            if (MetroDict.MODE_LEGACY_READONLY.equals(order.getRecordMode())) {
+                throw new BizException("已核验旧文本只读保留，不能再次改变流转结论");
+            }
             if (order.getConclusion() == null || order.getConclusion().isBlank()) {
                 throw new BizException("出证前必须先录入检定结论（合格 / 限用 / 不合格）");
             }
@@ -330,7 +365,15 @@ public class CalibrationOrderService {
         if ("ISSUED".equals(next) && (order.getCertNo() == null || order.getCertNo().isBlank())) {
             throw new BizException("发放前必须完成出证并填写证书编号");
         }
+        if ("ISSUED".equals(next)) {
+            // 最终防线：结构化证书必须钉住已确认版本；旧文本则在发放一刻冻结为只读历史。
+            originalRecordService.freezeOnIssue(order);
+        }
         order.setStatus(next);
+        if ("VERIFYING".equals(next) && MetroDict.MODE_LEGACY_TEXT.equals(order.getRecordMode())) {
+            // 旧文本一旦进入核验即冻结为只读历史，不能再借升级或回退改动原结论
+            order.setRecordMode(MetroDict.MODE_LEGACY_READONLY);
+        }
         order.setUpdatedAt(LocalDateTime.now());
         orderRepository.save(order);
         if ("ISSUED".equals(next)) {
@@ -371,6 +414,20 @@ public class CalibrationOrderService {
         }
         if ("ISSUED".equals(order.getStatus())) {
             throw new BizException("已发放的委托单不能回退，如需更正请另开委托单");
+        }
+        if ("VERIFYING".equals(order.getStatus())) {
+            if (MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())) {
+                throw new BizException("核验环节不能用普通回退改数；请由核验员写明原因退回并生成新版本");
+            }
+            throw new BizException("已进入核验的旧文本记录不能退回改结论；只读保留或由授权人员按制度处理");
+        }
+        if ("CERTIFYING".equals(order.getStatus())) {
+            if (MetroDict.MODE_STRUCTURED.equals(order.getRecordMode())) {
+                throw new BizException("出证前修改请使用「发起修订」，系统会保留已确认旧版并复制新版本草稿");
+            }
+            if (MetroDict.MODE_LEGACY_READONLY.equals(order.getRecordMode())) {
+                throw new BizException("已核验旧文本只读保留，不能回退改变原结论");
+            }
         }
         boolean backToReceived = "CALIBRATING".equals(order.getStatus());
         order.setStatus(MetroDict.FLOW_ORDER.get(index - 1));
@@ -434,7 +491,7 @@ public class CalibrationOrderService {
                 blocked
                         ? new OrderDeviceService.GateCheck(false, false, null, List.of("标准器当前不满足放行条件，详见详情"))
                         : OrderDeviceService.GateCheck.pass(),
-                List.of(), List.of());
+                List.of(), List.of(), null);
     }
 
     private Views.OrderView toView(CalibrationOrder order, ViewContext context,
@@ -442,7 +499,8 @@ public class CalibrationOrderService {
                                    boolean detail,
                                    OrderDeviceService.GateCheck gate,
                                    List<Views.OrderDeviceView> devices,
-                                   List<Views.DeviceLinkHistoryView> history) {
+                                   List<Views.DeviceLinkHistoryView> history,
+                                   Views.RecordBundleView records) {
         Instrument instrument = context.instrumentMap.get(order.getInstrumentId());
         var procedure = context.procedureMap.get(order.getProcedureId());
         boolean voided = MetroDict.STATUS_VOIDED.equals(order.getStatus());
@@ -483,7 +541,8 @@ public class CalibrationOrderService {
                 gate.passed() ? List.of() : gate.reasons(),
                 MetroDict.canEditDevices(order.getStatus()),
                 detail ? devices : null,
-                detail ? history : null);
+                detail ? history : null,
+                detail ? records : null);
     }
 
     /** 一次取全，避免逐条查询 */

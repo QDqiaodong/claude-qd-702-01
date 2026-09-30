@@ -7,14 +7,17 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.metrology.lab.common.ApiResponse;
 import com.metrology.lab.dto.CalibrationOrderDtos;
+import com.metrology.lab.dto.OriginalRecordDtos;
 import com.metrology.lab.dto.Views;
 import com.metrology.lab.service.CalibrationOrderService;
+import com.metrology.lab.service.OriginalRecordService;
 
 import jakarta.validation.Valid;
 
@@ -29,9 +32,12 @@ import jakarta.validation.Valid;
 public class CalibrationOrderController {
 
     private final CalibrationOrderService orderService;
+    private final OriginalRecordService recordService;
 
-    public CalibrationOrderController(CalibrationOrderService orderService) {
+    public CalibrationOrderController(CalibrationOrderService orderService,
+                                      OriginalRecordService recordService) {
         this.orderService = orderService;
+        this.recordService = recordService;
     }
 
     @GetMapping
@@ -53,8 +59,17 @@ public class CalibrationOrderController {
     }
 
     @GetMapping("/{id}")
-    public ApiResponse<Views.OrderView> detail(@PathVariable Long id) {
-        return ApiResponse.success(orderService.detail(id));
+    public ApiResponse<Views.OrderView> detail(@PathVariable Long id,
+                                               @RequestHeader(value = "X-Operator-Name", required = false)
+                                               String operatorName) {
+        return ApiResponse.success(orderService.detail(id, operatorName));
+    }
+
+    /** 当前操作者（演示环境由页面选择，真实环境应由认证网关注入） */
+    @GetMapping("/operators/me")
+    public ApiResponse<Views.OperatorView> me(@RequestHeader(value = "X-Operator-Name", required = false)
+                                              String operatorName) {
+        return ApiResponse.success(recordService.currentOperator(operatorName));
     }
 
     /** 【@NaturalId】按器具编号建委托单 */
@@ -83,6 +98,83 @@ public class CalibrationOrderController {
     @PostMapping("/{id}/void")
     public ApiResponse<Views.OrderView> voidOrder(@PathVariable Long id) {
         return ApiResponse.success("委托已作废，标准器占用已释放", orderService.voidOrder(id));
+    }
+
+    // ============================ 结构化原始记录与版本留痕 ============================
+
+    @PostMapping("/{id}/records/draft")
+    public ApiResponse<Views.RecordBundleView> createDraft(
+            @PathVariable Long id,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("已建立结构化原始记录草稿", recordService.createDraft(id, operatorName));
+    }
+
+    @PutMapping("/{id}/records/draft")
+    public ApiResponse<Views.RecordBundleView> saveDraft(
+            @PathVariable Long id,
+            @RequestBody(required = false) @Valid OriginalRecordDtos.DraftSaveReq req,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("草稿已保存，尚未锁定", recordService.saveDraft(id, req, operatorName));
+    }
+
+    @PostMapping("/{id}/records/submit")
+    public ApiResponse<Views.RecordBundleView> submit(
+            @PathVariable Long id,
+            @RequestBody(required = false) @Valid OriginalRecordDtos.DraftSaveReq req,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("本版本已提交复核并锁定", recordService.submit(id, req, operatorName));
+    }
+
+    @PostMapping("/{id}/records/approve")
+    public ApiResponse<Views.RecordBundleView> approve(
+            @PathVariable Long id,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("核验通过，证书已固定引用该确认版本", recordService.approve(id, operatorName));
+    }
+
+    @PostMapping("/{id}/records/return")
+    public ApiResponse<Views.RecordBundleView> returnRecord(
+            @PathVariable Long id,
+            @RequestBody @Valid OriginalRecordDtos.ReviewReq req,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("已写明原因退回，并生成新版本草稿",
+                recordService.returnVersion(id, req, operatorName));
+    }
+
+    @PostMapping("/{id}/records/withdraw")
+    public ApiResponse<Views.RecordBundleView> withdraw(
+            @PathVariable Long id,
+            @RequestBody(required = false) OriginalRecordDtos.RevisionReq req,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("已撤回误提交版本，并复制生成新草稿",
+                recordService.withdraw(id, operatorName, req == null ? null : req.getReason()));
+    }
+
+    @PostMapping("/{id}/records/revision")
+    public ApiResponse<Views.RecordBundleView> revision(
+            @PathVariable Long id,
+            @RequestBody @Valid OriginalRecordDtos.RevisionReq req,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("已保留旧确认版，并复制生成修订草稿",
+                recordService.startRevision(id, req, operatorName));
+    }
+
+    @PutMapping("/{id}/records/assignment")
+    public ApiResponse<Views.RecordBundleView> assign(
+            @PathVariable Long id,
+            @RequestBody @Valid OriginalRecordDtos.AssignReq req,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        return ApiResponse.success("人员调整已记录", recordService.assign(id, req, operatorName));
+    }
+
+    @PostMapping("/{id}/records/migrate-legacy")
+    public ApiResponse<Views.RecordBundleView> migrateLegacy(
+            @PathVariable Long id,
+            @RequestBody(required = false) @Valid OriginalRecordDtos.MigrateLegacyReq req,
+            @RequestHeader(value = "X-Operator-Name", required = false) String operatorName) {
+        String actor = req == null ? operatorName : req.getConfirmedBy();
+        return ApiResponse.success("旧文本已转换为第一版结构化草稿，原文继续保留为历史记录",
+                recordService.migrateLegacy(id, actor));
     }
 
     /** 挂接选择器：全部标准器 + 实时占用冲突 + 本笔已选 */

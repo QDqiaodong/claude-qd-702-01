@@ -8,6 +8,16 @@ import { ElMessage } from 'element-plus'
  */
 const http = axios.create({ baseURL: '/api', timeout: 15000 })
 
+/** 演示环境的当前操作者；服务端仍会重新判定角色与指派关系，前端身份不能提权。 */
+export function operatorHeaders() {
+  try {
+    const name = localStorage.getItem('operatorName')
+    return name ? { 'X-Operator-Name': name } : {}
+  } catch {
+    return {}
+  }
+}
+
 http.interceptors.response.use(
   (res) => {
     const body = res.data
@@ -68,7 +78,7 @@ export const orderApi = {
   list: (params) => http.get('/calibration-orders', { params: params || {} }),
   queue: () => http.get('/calibration-orders/queue'),
   overview: () => http.get('/calibration-orders/overview'),
-  detail: (id) => http.get(`/calibration-orders/${id}`),
+  detail: (id) => http.get(`/calibration-orders/${id}`, { headers: operatorHeaders() }),
   create: (data) => http.post('/calibration-orders', data),
   result: (id, data) => http.post(`/calibration-orders/${id}/result`, data),
   advance: (id) => http.post(`/calibration-orders/${id}/advance`, null, { hideError: true }),
@@ -76,7 +86,26 @@ export const orderApi = {
   void: (id) => http.post(`/calibration-orders/${id}/void`),
   deviceOptions: (id) => http.get(`/calibration-orders/${id}/device-options`),
   saveDevices: (id, deviceIds) =>
-    http.put(`/calibration-orders/${id}/devices`, { deviceIds }, { hideError: true })
+    http.put(`/calibration-orders/${id}/devices`, { deviceIds }, { hideError: true }),
+
+  // ---- 结构化原始记录与版本留痕（操作者身份经请求头送服务端最终判定） ----
+  createDraft: (id) => http.post(`/calibration-orders/${id}/records/draft`, null, { headers: operatorHeaders() }),
+  saveDraft: (id, data) =>
+    http.put(`/calibration-orders/${id}/records/draft`, data, { headers: operatorHeaders() }),
+  submitRecord: (id, data) =>
+    http.post(`/calibration-orders/${id}/records/submit`, data, { headers: operatorHeaders() }),
+  approveRecord: (id) =>
+    http.post(`/calibration-orders/${id}/records/approve`, null, { headers: operatorHeaders() }),
+  returnRecord: (id, reason) =>
+    http.post(`/calibration-orders/${id}/records/return`, { reason }, { headers: operatorHeaders() }),
+  withdrawRecord: (id, reason) =>
+    http.post(`/calibration-orders/${id}/records/withdraw`, reason ? { reason } : null, { headers: operatorHeaders() }),
+  startRevision: (id, reason) =>
+    http.post(`/calibration-orders/${id}/records/revision`, { reason }, { headers: operatorHeaders() }),
+  assign: (id, data) =>
+    http.put(`/calibration-orders/${id}/records/assignment`, data, { headers: operatorHeaders() }),
+  migrateLegacy: (id, confirmedBy) =>
+    http.post(`/calibration-orders/${id}/records/migrate-legacy`, { confirmedBy }, { headers: operatorHeaders() })
 }
 
 /** 模块五：标准器 */

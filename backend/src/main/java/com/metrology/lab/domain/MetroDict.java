@@ -47,6 +47,53 @@ public final class MetroDict {
             "CASH", "现结",
             "MONTHLY", "月结");
 
+    // ---------------- 原始记录版本 ----------------
+    public static final String RECORD_DRAFT = "DRAFT";
+    public static final String RECORD_SUBMITTED = "SUBMITTED";
+    public static final String RECORD_RETURNED = "RETURNED";
+    public static final String RECORD_CONFIRMED = "CONFIRMED";
+    public static final String RECORD_SUPERSEDED = "SUPERSEDED";
+    public static final String RECORD_WITHDRAWN = "WITHDRAWN";
+
+    private static final Map<String, String> RECORD_STATUS = Map.of(
+            RECORD_DRAFT, "草稿",
+            RECORD_SUBMITTED, "待核验",
+            RECORD_RETURNED, "已退回锁定",
+            RECORD_CONFIRMED, "已确认",
+            RECORD_SUPERSEDED, "已被替代",
+            RECORD_WITHDRAWN, "已撤回锁定");
+
+    private static final Map<String, String> RECORD_SOURCE = Map.of(
+            "NEW", "新建",
+            "MIGRATED", "旧文本转换",
+            "COPY_REJECTED", "退回复制",
+            "COPY_WITHDRAWN", "误提交撤回复制",
+            "COPY_REVISION", "修订复制");
+
+    private static final Map<String, String> RECORD_EVENT = Map.of(
+            "DRAFT_SAVED", "保存草稿",
+            "SUBMITTED", "提交复核",
+            "APPROVED", "核验通过",
+            "RETURNED", "核验退回",
+            "WITHDRAWN", "撤回提交",
+            "REVISION_STARTED", "发起修订",
+            "MIGRATED", "旧文本转换",
+            "ASSIGNED", "人员调整");
+
+    private static final Map<String, String> ACTOR_ROLE = Map.of(
+            "VERIFIER", "检定员",
+            "CHECKER", "核验员",
+            "COORDINATOR", "调度管理员");
+
+    public static final String MODE_LEGACY_TEXT = "LEGACY_TEXT";
+    public static final String MODE_STRUCTURED = "STRUCTURED";
+    public static final String MODE_LEGACY_READONLY = "LEGACY_READONLY";
+
+    private static final Map<String, String> RECORD_MODE = Map.of(
+            MODE_LEGACY_TEXT, "旧文本记录",
+            MODE_STRUCTURED, "结构化原始记录",
+            MODE_LEGACY_READONLY, "已核验旧文本只读");
+
     // ---------------- 标准器状态 ----------------
     private static final Map<String, String> DEVICE_STATUS = Map.of(
             "IN_USE", "在用",
@@ -114,6 +161,30 @@ public final class MetroDict {
 
     public static String conclusionName(String conclusion) {
         return conclusion == null ? "" : CONCLUSION.getOrDefault(conclusion, conclusion);
+    }
+
+    public static String recordStatusName(String status) {
+        return status == null ? "" : RECORD_STATUS.getOrDefault(status, status);
+    }
+
+    public static String recordSourceName(String source) {
+        return source == null ? "" : RECORD_SOURCE.getOrDefault(source, source);
+    }
+
+    public static String recordEventName(String eventType) {
+        return eventType == null ? "" : RECORD_EVENT.getOrDefault(eventType, eventType);
+    }
+
+    public static String actorRoleName(String role) {
+        return role == null ? "" : ACTOR_ROLE.getOrDefault(role, role);
+    }
+
+    public static String recordModeName(String mode) {
+        return mode == null ? "" : RECORD_MODE.getOrDefault(mode, mode);
+    }
+
+    public static boolean isEditableRecord(String status) {
+        return RECORD_DRAFT.equals(status);
     }
 
     public static boolean isValidSettleType(String type) {

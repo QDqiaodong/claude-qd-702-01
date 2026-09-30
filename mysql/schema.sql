@@ -26,6 +26,9 @@
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
 
+DROP TABLE IF EXISTS lab_record_event;
+DROP TABLE IF EXISTS lab_raw_record_item;
+DROP TABLE IF EXISTS lab_raw_record_version;
 DROP TABLE IF EXISTS lab_order_device;
 DROP TABLE IF EXISTS lab_calibration_order;
 DROP TABLE IF EXISTS lab_instrument;
@@ -101,7 +104,9 @@ CREATE TABLE lab_calibration_order (
     receive_date     DATE                   COMMENT '收样日期',
     verifier         VARCHAR(32)            COMMENT '检定员',
     checker          VARCHAR(32)            COMMENT '核验员',
-    measured_data    VARCHAR(500)           COMMENT '实测数据项（; 分隔多条，| 分隔 校准点|标准值|示值|示值误差）',
+    measured_data    VARCHAR(500)           COMMENT '实测数据项（历史文本，升级前数据只读保留；; 分隔多条，| 分隔 校准点|标准值|示值|示值误差）',
+    current_record_version_id BIGINT                 COMMENT '当前核验通过的原始记录版本 id（新确认版本后切换；NULL=尚无确认版本或纯旧文本委托）',
+    cert_record_version_id    BIGINT                 COMMENT '证书固定引用的原始记录版本 id（发放瞬间快照写入，此后永不变更）',
     conclusion       VARCHAR(16)            COMMENT 'PASS 合格 / LIMITED 限用 / FAIL 不合格',
     cert_no          VARCHAR(48)            COMMENT '证书编号',
     status           VARCHAR(20)   NOT NULL COMMENT 'RECEIVED 收样 / CALIBRATING 检定中 / VERIFYING 核验 / CERTIFYING 出证 / ISSUED 已发放',
@@ -155,6 +160,69 @@ CREATE TABLE lab_order_device (
     KEY idx_od_order (order_id, released_at),
     KEY idx_od_device (device_id, released_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='委托-标准器挂接与占用关系';
+
+
+-- ---------------------------- 7. 原始检定记录版本 ----------------------------
+-- 一行 = 一笔委托的一个原始记录版本（草稿/待核验/已确认/已退回/已撤回/已替代），全部保留、不物理删除。
+-- version_no 从 1 起：退回重提必须 +1（新版本），误提交撤回沿用同号（草稿承接）。
+-- 状态流转由服务端在委托行悲观锁内串行判定：
+--   DRAFT → SUBMITTED（冻结）→ CONFIRMED（旧 CONFIRMED 置 SUPERSEDED）
+--          SUBMITTED → REJECTED（派生下一版 DRAFT，明细整版复制）
+--          SUBMITTED → WITHDRAWN（同号 DRAFT 承接，提交事实留痕）
+CREATE TABLE lab_raw_record_version (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    order_id        BIGINT       NOT NULL COMMENT '所属委托 id',
+    version_no      INT          NOT NULL COMMENT '版本序号（退回重提 +1；撤回沿用同号）',
+    status          VARCHAR(16)  NOT NULL COMMENT 'DRAFT 草稿 / SUBMITTED 待核验 / CONFIRMED 已确认 / REJECTED 已退回 / WITHDRAWN 已撤回 / SUPERSEDED 已替代',
+    conclusion      VARCHAR(16)           COMMENT '提交时结论 PASS/LIMITED/FAIL（随版本冻结）',
+    submitted_by    VARCHAR(32)           COMMENT '提交人（检定员，提交时写入冻结）',
+    submitted_at    DATETIME              COMMENT '提交时间',
+    confirmed_by    VARCHAR(32)           COMMENT '核验通过人（核验员）',
+    confirmed_at    DATETIME              COMMENT '核验通过时间',
+    rejected_by     VARCHAR(32)           COMMENT '退回/打回操作人（核验员）',
+    rejected_at     DATETIME              COMMENT '退回时间',
+    reject_reason   VARCHAR(500)          COMMENT '退回原因（必填，检定员据此修订）',
+    origin          VARCHAR(16)           COMMENT '草稿来源：MANUAL 手建 / REJECT 退回派生 / WITHDRAW 撤回承接 / LEGACY 旧文本转换',
+    remark          VARCHAR(500)          COMMENT '整版备注（环境条件、读数说明等）',
+    created_at      DATETIME     NOT NULL COMMENT '建立时间',
+    updated_at      DATETIME              COMMENT '最后更新时间',
+    PRIMARY KEY (id),
+    KEY idx_rrv_order (order_id, version_no),
+    KEY idx_rrv_status (order_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='原始检定记录版本';
+
+-- ---------------------------- 8. 原始记录数据项明细 ----------------------------
+-- 每个版本各自一份完整明细：版本间可逐行逐字段比对；版本离开草稿后明细只读，
+-- 服务端不存在改/删已冻结版本明细的路径（退回重提是新版本 + 新明细，旧版不受影响）。
+CREATE TABLE lab_raw_record_item (
+    id               BIGINT       NOT NULL AUTO_INCREMENT,
+    version_id       BIGINT       NOT NULL COMMENT '所属版本 id',
+    line_no          INT          NOT NULL COMMENT '版内行序（从 1 起，连续）',
+    cal_point        VARCHAR(80)           COMMENT '校准点（检定点位）',
+    standard_value   VARCHAR(60)           COMMENT '标准值（保留原始书写）',
+    indicated_value  VARCHAR(60)           COMMENT '示值',
+    error_value      VARCHAR(60)           COMMENT '示值误差',
+    unit             VARCHAR(20)           COMMENT '计量单位（mm/MPa/V…）',
+    remark           VARCHAR(200)          COMMENT '本行必要备注（异常/复测/修正）',
+    PRIMARY KEY (id),
+    KEY idx_rri_version (version_id, line_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='原始记录数据项明细';
+
+-- ---------------------------- 9. 原始记录与人员流转事件留痕（append-only） ----------------------------
+-- 只插入、不修改不删除：退回意见、提交/确认人与时间、撤回、人员改派、出证打回、证书固定全部可追溯。
+CREATE TABLE lab_record_event (
+    id           BIGINT       NOT NULL AUTO_INCREMENT,
+    order_id     BIGINT       NOT NULL COMMENT '所属委托 id',
+    version_id   BIGINT                COMMENT '关联版本 id（人员改派可空）',
+    version_no   INT                   COMMENT '关联版本号',
+    event_type   VARCHAR(24)  NOT NULL COMMENT 'DRAFT_CREATE/CONVERTED/SUBMIT/CONFIRM/REJECT/WITHDRAW/SUPERSEDE/CERT_REOPEN/ASSIGN/CERT_FIXED',
+    actor        VARCHAR(32)           COMMENT '操作人（具名留痕）',
+    detail       VARCHAR(500)          COMMENT '事件说明 / 退回原因 / 改派前后值',
+    created_at   DATETIME     NOT NULL COMMENT '事件时间',
+    PRIMARY KEY (id),
+    KEY idx_re_order (order_id, id),
+    KEY idx_re_version (version_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='原始记录流转事件留痕';
 
 
 -- ---------------------------- 送检客户 ----------------------------
@@ -324,5 +392,47 @@ INSERT INTO lab_order_device (id, order_id, device_id, linked_at, cert_valid_sna
     (17, 19, 11, '2026-09-24 11:00:00', '2028-04-11', '2026-09-25 10:20:00', 'VOIDED'),
     -- 历史留痕：15 号曾从检定中退回收样一次，STD-0006 被释放后又重新挂接（见第 11 行）
     (18, 15, 6,  '2026-09-24 10:05:00', '2027-10-21', '2026-09-24 15:30:00', 'ROLLBACK_RECEIVED');
+
+
+-- ---------------------------- 原始记录版本与明细（结构化记录演示种子） ----------------------------
+-- 8 号 WT2026-0008（核验中）：第 1 版已提交锁定，等待核验员「孙敬之」确认或写原因退回。
+-- 5 号 WT2026-0005（出证中）：第 1 版已核验通过（当前生效版本），证书尚未发放，cert_record_version_id 仍空；
+--    发放后才会固定（新流程演示走实际操作；此处不预置固定值）。
+-- 14 号 WT2026-0014（检定中、无旧文本）：第 1 版空白草稿，演示批量录入。
+-- 其余已核验/已发放委托（1/2/3/4/18 等）保持旧文本只读，不补结构化版本——升级不改变原结论。
+INSERT INTO lab_raw_record_version
+    (id, order_id, version_no, status, conclusion, submitted_by, submitted_at, confirmed_by, confirmed_at,
+     rejected_by, rejected_at, reject_reason, origin, remark, created_at, updated_at) VALUES
+    -- 8 号：已提交待核验（本版锁定，核验员只能确认/退回）
+    (1,  8,  1, 'SUBMITTED', 'PASS', '林砚秋', '2026-09-23 10:40:00', NULL, NULL, NULL, NULL, NULL,
+     'LEGACY', '由旧文本转第一版后提交核验；300℃ 点偏差偏大待核验判定', '2026-09-23 10:20:00', '2026-09-23 10:40:00'),
+    -- 5 号：已确认（出证依据），旧 CONFIRMED 无替代版本
+    (2,  5,  1, 'CONFIRMED', 'LIMITED', '陈听澜', '2026-09-22 16:10:00', '孙敬之', '2026-09-23 09:05:00',
+     NULL, NULL, NULL, 'MANUAL', '限定量程使用见委托备注', '2026-09-22 14:00:00', '2026-09-23 09:05:00'),
+    -- 14 号：检定中空白草稿
+    (3,  14, 1, 'DRAFT', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+     'MANUAL', NULL, '2026-09-24 09:00:00', '2026-09-24 09:00:00');
+
+INSERT INTO lab_raw_record_item (version_id, line_no, cal_point, standard_value, indicated_value, error_value, unit, remark) VALUES
+    -- 8 号第 1 版：3 个温度点（旧文本转结构化，单位按读数补 ℃）
+    (1, 1, '0℃',       '+0.00℃',   '+0.03℃',   '+0.03℃', '℃', NULL),
+    (1, 2, '100.00℃',   '+100.00℃', '+100.06℃', '+0.06℃', '℃', NULL),
+    (1, 3, '300.00℃',   '+300.00℃', '+300.21℃', '+0.21℃', '℃', '偏差偏大，核验重点'),
+    -- 5 号第 1 版：3 个量块点（限用）
+    (2, 1, '10mm',  '+10.0000mm', '+10.0001mm', '+0.10μm', 'mm', NULL),
+    (2, 2, '50mm',  '+50.0000mm', '+50.0002mm', '+0.20μm', 'mm', NULL),
+    (2, 3, '100mm', '+100.0000mm', '+100.0003mm', '+0.30μm', 'mm', NULL);
+
+-- 8 号、5 号的事件留痕（与版本时间一致，演示「旧版本/提交人/时间持续可查」）
+INSERT INTO lab_record_event (order_id, version_id, version_no, event_type, actor, detail, created_at) VALUES
+    (8,  1, 1, 'DRAFT_CREATE', '林砚秋', '旧文本实测数据转为第 1 版结构化草稿（解析出 3 条；原文本原样保留并标记为历史记录），请核对后再提交复核', '2026-09-23 10:20:00'),
+    (8,  1, 1, 'SUBMIT',       '林砚秋', '第 1 版提交复核，共 3 条数据项', '2026-09-23 10:40:00'),
+    (5,  2, 1, 'DRAFT_CREATE', '陈听澜', '检定员建立第 1 版原始记录草稿', '2026-09-22 14:00:00'),
+    (5,  2, 1, 'SUBMIT',       '陈听澜', '第 1 版提交复核，共 3 条数据项', '2026-09-22 16:10:00'),
+    (5,  2, 1, 'CONFIRM',      '孙敬之', '核验通过，第 1 版确认为出证依据', '2026-09-23 09:05:00'),
+    (14, 3, 1, 'DRAFT_CREATE', '系统',   '进入检定环节，自动建立空白原始记录草稿', '2026-09-24 09:00:00');
+
+-- 委托指针：5 号当前确认版本 = 2（证书固定引用留待发放时写入，这里刻意置空以演示「发放才固定」）
+UPDATE lab_calibration_order SET current_record_version_id = 2 WHERE id = 5;
 
 SET FOREIGN_KEY_CHECKS = 1;

@@ -45,21 +45,6 @@ public final class CalibrationOrderDtos {
         private String remark;
     }
 
-    /** 录入/修订实测数据与结论 */
-    @Data
-    public static class ResultReq {
-
-        private String measuredData;
-
-        private String conclusion;
-
-        private String certNo;
-
-        private String verifier;
-
-        private String checker;
-    }
-
     /** 出证时确认证书有效期与收费 */
     @Data
     public static class CertifyReq {

@@ -70,13 +70,36 @@ export const orderApi = {
   overview: () => http.get('/calibration-orders/overview'),
   detail: (id) => http.get(`/calibration-orders/${id}`),
   create: (data) => http.post('/calibration-orders', data),
-  result: (id, data) => http.post(`/calibration-orders/${id}/result`, data),
   advance: (id) => http.post(`/calibration-orders/${id}/advance`, null, { hideError: true }),
   rollback: (id) => http.post(`/calibration-orders/${id}/rollback`),
   void: (id) => http.post(`/calibration-orders/${id}/void`),
   deviceOptions: (id) => http.get(`/calibration-orders/${id}/device-options`),
   saveDevices: (id, deviceIds) =>
-    http.put(`/calibration-orders/${id}/devices`, { deviceIds }, { hideError: true })
+    http.put(`/calibration-orders/${id}/devices`, { deviceIds }, { hideError: true }),
+
+  // —— 原始检定记录与版本留痕（角色/版本/状态全部由服务端最终判定）——
+  recordPanel: (id) => http.get(`/calibration-orders/${id}/records`),
+  versionItems: (id, versionId) =>
+    http.get(`/calibration-orders/${id}/records/${versionId}/items`),
+  createDraft: (id, operator) => http.post(`/calibration-orders/${id}/records/drafts`, { operator }),
+  saveDraft: (id, versionId, data) =>
+    http.put(`/calibration-orders/${id}/records/drafts/${versionId}`, data),
+  withdraw: (id, versionId, operator) =>
+    http.post(`/calibration-orders/${id}/records/${versionId}/withdraw`, { operator }),
+  convertLegacy: (id, operator) =>
+    http.post(`/calibration-orders/${id}/records/convert-legacy`, { operator }, { hideError: true }),
+  diff: (id, baseVersionId, compareVersionId) =>
+    http.get(`/calibration-orders/${id}/records/diff`, { params: { baseVersionId, compareVersionId } }),
+  submitRecord: (id, versionId, operator) =>
+    http.post(`/calibration-orders/${id}/records/${versionId}/submit`, { operator }),
+  confirmRecord: (id, versionId, operator) =>
+    http.post(`/calibration-orders/${id}/records/${versionId}/confirm`, { operator }),
+  rejectRecord: (id, versionId, data) =>
+    http.post(`/calibration-orders/${id}/records/${versionId}/reject`, data, { hideError: true }),
+  reopenRecord: (id, versionId, data) =>
+    http.post(`/calibration-orders/${id}/records/${versionId}/reopen`, data, { hideError: true }),
+  saveCertInfo: (id, data) => http.put(`/calibration-orders/${id}/cert-info`, data),
+  reassign: (id, data) => http.put(`/calibration-orders/${id}/assignees`, data, { hideError: true })
 }
 
 /** 模块五：标准器 */

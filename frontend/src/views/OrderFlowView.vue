@@ -111,32 +111,29 @@
           @click="voidOrder"
         >作废</el-button>
       </div>
+      <div v-if="order.status === 'VERIFYING' || order.status === 'CALIBRATING'" class="flow-hint">
+        {{ order.status === 'VERIFYING'
+          ? '核验环节：请在下方原始记录中「确认通过」或「写明原因退回」，不能直接改数或无因回退。'
+          : '检定完成后在下方原始记录中「提交复核」进入核验（会做标准器放行校验）。' }}
+      </div>
 
-      <div v-if="order.status !== 'VOIDED'" class="flow-form">
-        <div class="flow-form-title">结论与证书信息</div>
-        <el-form label-width="72px" size="small">
-          <el-form-item label="实测数据">
-            <el-input v-model="form.measuredData" type="textarea" :rows="4"
-                      placeholder="每行一条：校准点|标准值|示值|示值误差" />
-          </el-form-item>
-          <el-form-item label="检定结论">
-            <el-select v-model="form.conclusion" placeholder="未判定" clearable style="width: 100%">
-              <el-option label="合格" value="PASS" />
-              <el-option label="限用" value="LIMITED" />
-              <el-option label="不合格" value="FAIL" />
-            </el-select>
-          </el-form-item>
+      <!-- 原始检定记录与版本留痕（草稿/提交/核验/退回/版本对比/改派；作废态只读） -->
+      <RawRecordPanel ref="recordPanelRef" v-if="order.recordPanel"
+                      :order="order" @changed="lab.refreshAll()" />
+
+      <!-- 出证信息：证书编号/有效期只在出证环节可编辑，数据来自已确认版本不可改 -->
+      <div v-if="order.status === 'CERTIFYING'" class="flow-form">
+        <div class="flow-form-title">证书信息（引用第 {{ certVersionNo }} 版，数据不可改）</div>
+        <el-form label-width="86px" size="small">
           <el-form-item label="证书编号">
-            <el-input v-model="form.certNo" placeholder="出证前必填" />
+            <el-input v-model="certForm.certNo" placeholder="发放前必填" />
           </el-form-item>
-          <el-form-item label="检定员">
-            <el-input v-model="form.verifier" />
-          </el-form-item>
-          <el-form-item label="核验员">
-            <el-input v-model="form.checker" />
+          <el-form-item label="有效期至">
+            <el-date-picker v-model="certForm.certValidUntil" type="date" value-format="YYYY-MM-DD"
+                            placeholder="留空按检定周期推算" style="width: 100%" />
           </el-form-item>
           <el-form-item>
-            <el-button size="small" type="primary" @click="saveResult">保存检定数据</el-button>
+            <el-button size="small" type="primary" :loading="savingCert" @click="saveCertInfo">保存证书信息</el-button>
           </el-form-item>
         </el-form>
       </div>
@@ -157,6 +154,19 @@
         <div class="cert-no">
           <span>证书编号：{{ order.certNo || '待出证' }}</span>
           <span>委托单号：{{ order.orderNo || '—' }}</span>
+        </div>
+
+        <!-- 证书数据来源：已发放必须是固定版本；未发放为当前确认版本；旧委托标历史文本 -->
+        <div class="cert-source" :class="certSourceClass">
+          <span v-if="certData.source === 'STRUCTURED'">
+            📌 证书数据{{ order.status === 'ISSUED' ? '已固定' : '引用' }}：
+            第 {{ certData.versionNo }} 版原始记录 · {{ certData.sourceName }}
+            <template v-if="certData.confirmedBy">｜核验 {{ certData.confirmedBy }}</template>
+          </span>
+          <span v-else-if="certData.source === 'LEGACY_TEXT'">
+            📜 历史记录：升级前以文本保存的实测数据<span v-if="certData.legacyReadonly">（只读保留，不改变原结论）</span>
+          </span>
+          <span v-else>尚未形成可出证的检定数据</span>
         </div>
 
         <table class="cert-info">
@@ -183,17 +193,20 @@
         <div class="cert-subtitle">检定结果（环境条件：{{ envText }}）</div>
         <table class="cert-data">
           <thead>
-            <tr><th>校准点</th><th>标准值</th><th>示值</th><th>示值误差</th></tr>
+            <tr><th>校准点</th><th>标准值</th><th>示值</th><th>示值误差</th><th>单位</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(row, i) in dataRows" :key="i">
-              <td>{{ row[0] || '—' }}</td>
-              <td>{{ row[1] || '—' }}</td>
-              <td>{{ row[2] || '—' }}</td>
-              <td>{{ row[3] || '—' }}</td>
+            <tr v-for="(row, i) in certRows" :key="i">
+              <td>{{ row.calPoint || '—' }}</td>
+              <td>{{ row.standardValue || '—' }}</td>
+              <td>{{ row.indicatedValue || '—' }}</td>
+              <td>{{ row.errorValue || '—' }}</td>
+              <td>{{ row.unit || '—' }}</td>
             </tr>
-            <tr v-if="!dataRows.length">
-              <td colspan="4" class="cert-empty">尚未录入实测数据</td>
+            <tr v-if="!certRows.length">
+              <td colspan="5" class="cert-empty">
+                {{ certData.source === 'NONE' ? '尚未录入检定数据' : '该版本暂无数据项' }}
+              </td>
             </tr>
           </tbody>
         </table>
@@ -209,8 +222,8 @@
         </div>
 
         <div class="cert-sign">
-          <div><span>检定员</span><b>{{ order.verifier || '待指派' }}</b></div>
-          <div><span>核验员</span><b>{{ order.checker || '待指派' }}</b></div>
+          <div><span>检定员</span><b>{{ certSigner.submitted || order.verifier || '待指派' }}</b></div>
+          <div><span>核验员</span><b>{{ certSigner.confirmed || order.checker || '待指派' }}</b></div>
           <div><span>批准人</span><b>{{ approver }}</b></div>
         </div>
 
@@ -326,9 +339,11 @@
 import { computed, inject, onMounted, reactive, ref, watch, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { instrumentApi, orderApi, procedureApi } from '../api'
+import RawRecordPanel from '../components/RawRecordPanel.vue'
 
 const lab = inject('lab')
 const order = computed(() => lab.currentOrder.value || {})
+const recordPanelRef = ref(null)
 
 const FLOW = [
   { key: 'RECEIVED', name: '收样' },
@@ -360,11 +375,15 @@ const activeStep = computed(() => {
   return order.value.stepIndex == null ? 0 : order.value.stepIndex
 })
 
+// 推进按钮仅在「收样→检定中」「出证→发放」两段有效；
+// 检定中→核验（提交复核）、核验→出证（确认通过）必须走原始记录面板的专属动作（服务端同样拦截）
+const ADVANCE_ALLOWED = ['RECEIVED', 'CERTIFYING']
 const canAdvance = computed(() =>
-  order.value.id != null && order.value.status !== 'ISSUED' && order.value.status !== 'VOIDED')
+  order.value.id != null && ADVANCE_ALLOWED.includes(order.value.status))
+// 回退仅「检定中→收样」放行；核验/出证的回退必须写明原因走记录面板
+const ROLLBACK_ALLOWED = ['CALIBRATING']
 const canRollback = computed(() =>
-  order.value.id != null && order.value.status !== 'RECEIVED'
-  && order.value.status !== 'ISSUED' && order.value.status !== 'VOIDED')
+  order.value.id != null && ROLLBACK_ALLOWED.includes(order.value.status))
 const canVoid = computed(() =>
   order.value.id != null && order.value.status !== 'ISSUED' && order.value.status !== 'VOIDED')
 
@@ -399,18 +418,36 @@ const envText = computed(() => {
   return p && p.envCondition ? p.envCondition : '温度 (20±5)℃，湿度 ≤70%RH'
 })
 
-/** 实测数据：多条 ';' 分隔，单条 '|' 分隔 */
-const dataRows = computed(() => {
-  const raw = order.value.measuredData
-  if (!raw) return []
-  return raw
-    .split(';')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => line.split('|'))
+/**
+ * 证书数据：永远取自服务端按「固定引用版本 → 当前确认版本 → 旧文本只读」算好的 certData，
+ * 预览/发放看到的内容不随后续草稿修订而变化。
+ */
+const certData = computed(() => order.value.recordPanel?.certData || { source: 'NONE', items: [] })
+const certVersionNo = computed(() => certData.value.versionNo || '—')
+const certSourceClass = computed(() => ({
+  'cert-source-pinned': order.value.status === 'ISSUED' && certData.value.source === 'STRUCTURED',
+  'cert-source-legacy': certData.value.source === 'LEGACY_TEXT'
+}))
+
+const certRows = computed(() => {
+  if (certData.value.source === 'STRUCTURED') {
+    return certData.value.items || []
+  }
+  if (certData.value.source === 'LEGACY_TEXT' && certData.value.legacyText) {
+    // 旧文本：; 分条、| 分列（无独立单位列，单位留 —）
+    return certData.value.legacyText.split(';').map((line) => {
+      const c = line.trim().split('|')
+      return {
+        calPoint: c[0] || '', standardValue: c[1] || '', indicatedValue: c[2] || '',
+        errorValue: c[3] || '', unit: ''
+      }
+    }).filter((r) => r.calPoint)
+  }
+  return []
 })
 
 const conclusionText = computed(() => {
+  // 证书结论跟随证书引用版本；旧文本/无版本时退回委托结论（可能为空）
   const map = { PASS: '合格', LIMITED: '限用', FAIL: '不合格' }
   return order.value.conclusion ? map[order.value.conclusion] : '未判定'
 })
@@ -434,34 +471,47 @@ const approver = computed(() => {
   return '待签发'
 })
 
-const form = reactive({ measuredData: '', conclusion: '', certNo: '', verifier: '', checker: '' })
+/** 证书签名：固定版本上的提交/核验人（旧文本退回委托字段） */
+const certSigner = computed(() => ({
+  submitted: certData.value.submittedBy || '',
+  confirmed: certData.value.confirmedBy || ''
+}))
+
+/** 出证信息表单（仅 CERTIFYING；数据与结论来自已确认版本，这里不可改） */
+const certForm = reactive({ certNo: '', certValidUntil: '' })
+const savingCert = ref(false)
 
 watch(
   order,
   (val) => {
-    form.measuredData = val && val.measuredData ? val.measuredData.split(';').join('\n') : ''
-    form.conclusion = val && val.conclusion ? val.conclusion : ''
-    form.certNo = val && val.certNo ? val.certNo : ''
-    form.verifier = val && val.verifier ? val.verifier : ''
-    form.checker = val && val.checker ? val.checker : ''
+    certForm.certNo = val && val.certNo ? val.certNo : ''
+    certForm.certValidUntil = val && val.certValidUntil ? val.certValidUntil : ''
     // 切换委托后清掉上一笔的推进报错（新一笔的状态以详情接口实时结果为准）
     gateError.value = ''
   },
   { immediate: true }
 )
 
-async function saveResult() {
-  if (!order.value.id) return
-  const payload = {
-    measuredData: form.measuredData.split('\n').map((s) => s.trim()).filter(Boolean).join(';'),
-    conclusion: form.conclusion || null,
-    certNo: form.certNo || null,
-    verifier: form.verifier || null,
-    checker: form.checker || null
+async function saveCertInfo() {
+  // 操作人取记录面板上的操作人选择（出证环节一般为核验员/所务；服务端只要求具名）
+  const operator = recordPanelRef.value?.currentOperator
+    || (order.value.checker && order.value.checker !== '待分配' ? order.value.checker : '')
+  if (!operator) {
+    ElMessage.warning('请先在原始记录面板选择当前操作人')
+    return
   }
-  await orderApi.result(order.value.id, payload)
-  ElMessage.success('实测数据与结论已保存')
-  await lab.refreshAll()
+  savingCert.value = true
+  try {
+    await orderApi.saveCertInfo(order.value.id, {
+      operator,
+      certNo: certForm.certNo || null,
+      certValidUntil: certForm.certValidUntil || null
+    })
+    ElMessage.success('证书信息已保存（引用版本不变）')
+    await lab.refreshAll()
+  } finally {
+    savingCert.value = false
+  }
 }
 
 /** 推进失败信息驻留页面：只以服务端最新判定为准，任何前端操作都改不掉它 */
@@ -747,6 +797,13 @@ onMounted(loadOptions)
   border-top: 1px dashed var(--mt-border);
 }
 
+.flow-hint {
+  font-size: 11px;
+  color: var(--mt-warn);
+  line-height: 1.5;
+  padding: 4px 2px 8px;
+}
+
 .flow-form-title {
   font-size: 13px;
   font-weight: 600;
@@ -848,7 +905,30 @@ onMounted(loadOptions)
   justify-content: space-between;
   font-size: 11px;
   color: #6a6357;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
+}
+
+.cert-source {
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 3px 6px;
+  border-radius: 3px;
+  margin-bottom: 8px;
+  background: #eef7ee;
+  color: #2e6b2e;
+  border: 1px dashed #9cc79c;
+}
+
+.cert-source-pinned {
+  background: #fdf6e8;
+  color: #8a6114;
+  border-color: #d9b76a;
+}
+
+.cert-source-legacy {
+  background: #f4f4f6;
+  color: #6b6670;
+  border-color: #c9c5cf;
 }
 
 .cert-info {

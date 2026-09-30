@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.metrology.lab.common.ApiResponse;
 import com.metrology.lab.dto.CalibrationOrderDtos;
+import com.metrology.lab.dto.RawRecordDtos;
 import com.metrology.lab.dto.Views;
 import com.metrology.lab.service.CalibrationOrderService;
 
@@ -22,7 +23,8 @@ import jakarta.validation.Valid;
  * 模块四：检定委托与流转单 —— 全站主业务接口。
  *
  * <p>{@code POST /api/calibration-orders} 用<b>器具编号</b>入参，服务端通过 {@code @NaturalId}
- * 自然主键加载器具后建单，流转状态由 {@code advance / rollback} 推进。
+ * 自然主键加载器具后建单。原始记录的草稿/提交/核验/版本对比在 {@link RawRecordController}；
+ * 与流转状态联动的编排（提交即进核验、确认即进出证、出证信息、人员改派、打回重核）在本控制器。
  */
 @RestController
 @RequestMapping("/api/calibration-orders")
@@ -63,10 +65,54 @@ public class CalibrationOrderController {
         return ApiResponse.success("委托单已受理，流转状态：收样", orderService.create(req));
     }
 
-    @PostMapping("/{id}/result")
-    public ApiResponse<Views.OrderView> result(@PathVariable Long id,
-                                               @RequestBody CalibrationOrderDtos.ResultReq req) {
-        return ApiResponse.success("实测数据与结论已保存", orderService.saveResult(id, req));
+    /** 提交复核：版本锁定 + 委托进入核验（服务端角色分离与放行校验） */
+    @PostMapping("/{id}/records/{versionId}/submit")
+    public ApiResponse<Views.OrderView> submitRecord(@PathVariable Long id,
+                                                     @PathVariable Long versionId,
+                                                     @RequestBody @Valid RawRecordDtos.SubmitReq req) {
+        return ApiResponse.success("原始记录已提交复核，本版本已锁定",
+                orderService.submitRecord(id, versionId, req));
+    }
+
+    /** 核验通过：确认版本成为出证依据 + 委托进入出证 */
+    @PostMapping("/{id}/records/{versionId}/confirm")
+    public ApiResponse<Views.OrderView> confirmRecord(@PathVariable Long id,
+                                                      @PathVariable Long versionId,
+                                                      @RequestBody @Valid RawRecordDtos.ConfirmReq req) {
+        return ApiResponse.success("核验通过，该版本确认为出证依据，委托进入出证环节",
+                orderService.confirmRecord(id, versionId, req));
+    }
+
+    /** 核验退回：必须写原因；旧版留痕、自动派生下一版草稿、委托回到检定中 */
+    @PostMapping("/{id}/records/{versionId}/reject")
+    public ApiResponse<Views.OrderView> rejectRecord(@PathVariable Long id,
+                                                     @PathVariable Long versionId,
+                                                     @RequestBody @Valid RawRecordDtos.RejectReq req) {
+        return ApiResponse.success("已退回并生成下一版草稿，退回意见已留痕",
+                orderService.rejectRecord(id, versionId, req));
+    }
+
+    /** 出证环节打回重核（同样生成新版本，原确认版本只读保留） */
+    @PostMapping("/{id}/records/{versionId}/reopen")
+    public ApiResponse<Views.OrderView> reopen(@PathVariable Long id,
+                                               @PathVariable Long versionId,
+                                               @RequestBody @Valid RawRecordDtos.RejectReq req) {
+        return ApiResponse.success("已打回重核，原确认版本保留，系统生成下一版草稿",
+                orderService.reopenFromCertifying(id, versionId, req));
+    }
+
+    /** 出证信息：证书编号与有效期（数据来自已确认版本，此处不能改数据） */
+    @PutMapping("/{id}/cert-info")
+    public ApiResponse<Views.OrderView> certInfo(@PathVariable Long id,
+                                                 @RequestBody @Valid RawRecordDtos.CertInfoReq req) {
+        return ApiResponse.success("证书信息已保存（引用版本不变）", orderService.saveCertInfo(id, req));
+    }
+
+    /** 人员改派（误指派/人员调整的可恢复路径，全程留痕） */
+    @PutMapping("/{id}/assignees")
+    public ApiResponse<Views.OrderView> reassign(@PathVariable Long id,
+                                                 @RequestBody @Valid RawRecordDtos.ReassignReq req) {
+        return ApiResponse.success("人员改派已完成并留痕", orderService.reassign(id, req));
     }
 
     @PostMapping("/{id}/advance")

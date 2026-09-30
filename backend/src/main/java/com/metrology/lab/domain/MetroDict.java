@@ -47,6 +47,34 @@ public final class MetroDict {
             "CASH", "现结",
             "MONTHLY", "月结");
 
+    // ---------------- 原始记录版本状态 ----------------
+    // DRAFT 草稿：检定员可批量增删/复制/粘贴；SUBMITTED 待核验：本版冻结，只能确认或退回；
+    // CONFIRMED 已确认：出证依据；REJECTED 已退回：留痕只读并派生下一版草稿；
+    // WITHDRAWN 已撤回：误提交恢复，同版回到草稿；SUPERSEDED 已被更新的确认版本替代。
+    private static final Map<String, String> RECORD_STATUS = Map.of(
+            "DRAFT", "草稿",
+            "SUBMITTED", "待核验",
+            "CONFIRMED", "已确认",
+            "REJECTED", "已退回",
+            "WITHDRAWN", "已撤回",
+            "SUPERSEDED", "已替代");
+
+    // ---------------- 原始记录留痕事件 ----------------
+    private static final Map<String, String> RECORD_EVENT = Map.of(
+            "DRAFT_CREATE", "建立草稿",
+            "CONVERTED", "旧文本转第一版",
+            "SUBMIT", "提交复核",
+            "CONFIRM", "核验通过",
+            "REJECT", "核验退回",
+            "WITHDRAW", "撤回提交",
+            "SUPERSEDE", "新版本替代",
+            "CERT_REOPEN", "出证打回重核",
+            "ASSIGN", "人员改派",
+            "CERT_FIXED", "证书引用固定");
+
+    /** 未指派人员的占位姓名（种子数据中沿用，视为 null，不允许其代操作） */
+    public static final String UNASSIGNED = "待分配";
+
     // ---------------- 标准器状态 ----------------
     private static final Map<String, String> DEVICE_STATUS = Map.of(
             "IN_USE", "在用",
@@ -130,5 +158,26 @@ public final class MetroDict {
 
     public static String deviceStatusName(String status) {
         return status == null ? "" : DEVICE_STATUS.getOrDefault(status, status);
+    }
+
+    public static String recordStatusName(String status) {
+        return status == null ? "" : RECORD_STATUS.getOrDefault(status, status);
+    }
+
+    public static String recordEventName(String event) {
+        return event == null ? "" : RECORD_EVENT.getOrDefault(event, event);
+    }
+
+    /** 「待分配」视为未指派：不能以这个名字承担检定/核验操作 */
+    public static boolean isAssigned(String name) {
+        return name != null && !name.isBlank() && !UNASSIGNED.equals(name.trim());
+    }
+
+    public static String normalizeName(String name) {
+        if (name == null || name.isBlank()) {
+            return null;
+        }
+        String trimmed = name.trim();
+        return UNASSIGNED.equals(trimmed) ? null : trimmed;
     }
 }

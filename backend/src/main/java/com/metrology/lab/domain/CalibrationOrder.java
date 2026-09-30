@@ -56,9 +56,25 @@ public class CalibrationOrder {
     @Column(name = "checker", length = 32)
     private String checker;
 
-    /** 实测数据项：多条用 ; 分隔，单条为 校准点|标准值|示值|示值误差 */
+    /** 实测数据项（历史文本）：多条用 ; 分隔，单条为 校准点|标准值|示值|示值误差。
+     *  新流程改由 lab_raw_record_version/item 承载；本列只作为升级前历史记录只读保留。 */
     @Column(name = "measured_data", length = 500)
     private String measuredData;
+
+    /**
+     * 当前生效（最近一次核验通过）的原始记录版本 id。
+     * 新版本确认后指向新版；出证打回重核期间暂缺，重核通过后更新。null 表示尚无确认版本（含旧文本委托）。
+     */
+    @Column(name = "current_record_version_id")
+    private Long currentRecordVersionId;
+
+    /**
+     * 证书固定引用的原始记录版本 id：进入「已发放」那一刻快照写入，此后永不变更。
+     * 即使之后又产生修订版本（另开更正委托的情形外，本系统在发放后禁止新建版本），
+     * 证书预览/发放看到的数据始终来自该版本，杜绝静默改数。
+     */
+    @Column(name = "cert_record_version_id")
+    private Long certRecordVersionId;
 
     /** PASS 合格 / LIMITED 限用 / FAIL 不合格 */
     @Column(name = "conclusion", length = 16)

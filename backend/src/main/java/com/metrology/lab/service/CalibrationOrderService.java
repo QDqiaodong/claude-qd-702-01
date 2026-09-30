@@ -18,12 +18,15 @@ import com.metrology.lab.domain.Client;
 import com.metrology.lab.domain.Instrument;
 import com.metrology.lab.domain.MetroDict;
 import com.metrology.lab.domain.Procedure;
+import com.metrology.lab.domain.RawRecordVersion;
 import com.metrology.lab.dto.CalibrationOrderDtos;
+import com.metrology.lab.dto.RawRecordDtos;
 import com.metrology.lab.dto.Views;
 import com.metrology.lab.repository.CalibrationOrderRepository;
 import com.metrology.lab.repository.ClientRepository;
 import com.metrology.lab.repository.InstrumentRepository;
 import com.metrology.lab.repository.ProcedureRepository;
+import com.metrology.lab.repository.RawRecordVersionRepository;
 import com.metrology.lab.repository.StandardDeviceRepository;
 
 /**
@@ -45,6 +48,8 @@ public class CalibrationOrderService {
     private final ProcedureRepository procedureRepository;
     private final StandardDeviceRepository deviceRepository;
     private final OrderDeviceService orderDeviceService;
+    private final RawRecordService rawRecordService;
+    private final RawRecordVersionRepository recordVersionRepository;
 
     public CalibrationOrderService(CalibrationOrderRepository orderRepository,
                                    InstrumentService instrumentService,
@@ -52,7 +57,9 @@ public class CalibrationOrderService {
                                    ClientRepository clientRepository,
                                    ProcedureRepository procedureRepository,
                                    StandardDeviceRepository deviceRepository,
-                                   OrderDeviceService orderDeviceService) {
+                                   OrderDeviceService orderDeviceService,
+                                   RawRecordService rawRecordService,
+                                   RawRecordVersionRepository recordVersionRepository) {
         this.orderRepository = orderRepository;
         this.instrumentService = instrumentService;
         this.instrumentRepository = instrumentRepository;
@@ -60,6 +67,8 @@ public class CalibrationOrderService {
         this.procedureRepository = procedureRepository;
         this.deviceRepository = deviceRepository;
         this.orderDeviceService = orderDeviceService;
+        this.rawRecordService = rawRecordService;
+        this.recordVersionRepository = recordVersionRepository;
     }
 
     @Transactional(readOnly = true)
@@ -77,9 +86,10 @@ public class CalibrationOrderService {
                 orderDeviceService.activeSummary(orders.stream().map(CalibrationOrder::getId)
                         .collect(java.util.stream.Collectors.toSet()));
         java.util.Set<Long> blockedIds = orderDeviceService.blockedOrderIds();
+        Map<Long, Integer> versionNoMap = currentVersionNos(orders);
         List<Views.OrderView> list = new ArrayList<>();
         for (CalibrationOrder order : orders) {
-            list.add(toView(order, context, summaries, false, blockedIds.contains(order.getId())));
+            list.add(toView(order, context, summaries, false, blockedIds.contains(order.getId()), versionNoMap));
         }
         return list;
     }
@@ -181,9 +191,10 @@ public class CalibrationOrderService {
                 .filter(java.util.Objects::nonNull)
                 .min(LocalDate::compareTo)
                 .orElse(null);
+        Views.RecordPanelView panel = rawRecordService.panel(id);
         return toView(order, context(),
                 new OrderDeviceService.LinkSummary(devices.size(), earliest), true,
-                gate, devices, history);
+                gate, devices, history, panel);
     }
 
     // ============================ 挂接入口 ============================
@@ -268,24 +279,82 @@ public class CalibrationOrderService {
         return detail(order.getId());
     }
 
-    /** 录入/修订实测数据与结论 */
+    /**
+     * 提交复核的跨服务编排：RawRecordService 已在同一事务内冻结版本，
+     * 这里继续做标准器放行并把委托推进到「核验」。任一步失败整体回滚，版本不会停在「已提交但委托没动」。
+     * 收样态直接提交的，先落「检定中」（并补建空白草稿的兜底不适用——已有提交版本），再过放行关。
+     */
     @Transactional
-    public Views.OrderView saveResult(Long id, CalibrationOrderDtos.ResultReq req) {
-        CalibrationOrder order = require(id);
-        if ("ISSUED".equals(order.getStatus()) || MetroDict.STATUS_VOIDED.equals(order.getStatus())) {
-            throw new BizException("委托单已" + ("ISSUED".equals(order.getStatus()) ? "发放" : "作废") + "，不能再修改检定数据");
+    public Views.OrderView submitRecord(Long id, Long versionId, RawRecordDtos.SubmitReq req) {
+        rawRecordService.submit(id, versionId, req.getOperator());
+        CalibrationOrder order = orderRepository.lockById(id)
+                .orElseThrow(() -> new BizException("委托单不存在：id=" + id));
+        if (!"CALIBRATING".equals(order.getStatus()) && !"RECEIVED".equals(order.getStatus())) {
+            throw new BizException("委托当前处于「" + MetroDict.flowStatusName(order.getStatus())
+                    + "」，提交复核只能在收样/检定中进行");
         }
-        order.setMeasuredData(blankToNull(req.getMeasuredData()));
-        if (req.getConclusion() != null && !req.getConclusion().isBlank()
-                && !MetroDict.isValidConclusion(req.getConclusion())) {
-            throw new BizException("检定结论只能是 PASS / LIMITED / FAIL");
+        // 放行关与原流转一致：收样态提交（首次进入检定性环节）强制至少一件合格标准器；
+        // 已在检定中则只复核已挂设备是否仍有效，历史无挂接委托不强制（兼容旧数据）。
+        boolean enforce = "RECEIVED".equals(order.getStatus());
+        OrderDeviceService.GateCheck gate = orderDeviceService.checkGate(id, enforce);
+        if (!gate.passed()) {
+            throw new BizException(buildGateMessage("VERIFYING", gate));
         }
-        order.setConclusion(blankToNull(req.getConclusion()));
-        order.setCertNo(blankToNull(req.getCertNo()));
-        order.setVerifier(blankToNull(req.getVerifier()));
-        order.setChecker(blankToNull(req.getChecker()));
+        order.setStatus("VERIFYING");
         order.setUpdatedAt(LocalDateTime.now());
         orderRepository.save(order);
+        return detail(id);
+    }
+
+    /** 核验通过：版本确认（服务端角色判定）+ 委托推进到「出证」同事务完成 */
+    @Transactional
+    public Views.OrderView confirmRecord(Long id, Long versionId, RawRecordDtos.ConfirmReq req) {
+        rawRecordService.confirm(id, versionId, req.getOperator());
+        CalibrationOrder order = orderRepository.lockById(id)
+                .orElseThrow(() -> new BizException("委托单不存在：id=" + id));
+        if (!"VERIFYING".equals(order.getStatus())) {
+            throw new BizException("委托当前不在「核验」环节");
+        }
+        if (order.getConclusion() == null || order.getConclusion().isBlank()) {
+            throw new BizException("出证前必须有检定结论（已随确认版本写入）");
+        }
+        order.setStatus("CERTIFYING");
+        if (order.getCertValidUntil() == null) {
+            order.setCertValidUntil(defaultValidUntil(order));
+        }
+        order.setUpdatedAt(LocalDateTime.now());
+        orderRepository.save(order);
+        return detail(id);
+    }
+
+    /** 核验退回：版本退回留痕 + 派生下一版草稿 + 委托回到「检定中」（标准器已实际使用，占用保留） */
+    @Transactional
+    public Views.OrderView rejectRecord(Long id, Long versionId, RawRecordDtos.RejectReq req) {
+        rawRecordService.reject(id, versionId, req.getOperator(), req.getReason(),
+                RawRecordService.EV_REJECT);
+        CalibrationOrder order = orderRepository.lockById(id)
+                .orElseThrow(() -> new BizException("委托单不存在：id=" + id));
+        order.setStatus("CALIBRATING");
+        order.setUpdatedAt(LocalDateTime.now());
+        orderRepository.save(order);
+        return detail(id);
+    }
+
+    /** 出证阶段保存证书编号/有效期（数据来自已确认版本，此处不可改数据） */
+    @Transactional
+    public Views.OrderView saveCertInfo(Long id, RawRecordDtos.CertInfoReq req) {
+        LocalDate validUntil = null;
+        if (req.getCertValidUntil() != null && !req.getCertValidUntil().isBlank()) {
+            validUntil = LocalDate.parse(req.getCertValidUntil().trim());
+        }
+        rawRecordService.saveCertInfo(id, req, validUntil);
+        return detail(id);
+    }
+
+    /** 人员改派 */
+    @Transactional
+    public Views.OrderView reassign(Long id, RawRecordDtos.ReassignReq req) {
+        rawRecordService.reassign(id, req);
         return detail(id);
     }
 
@@ -316,19 +385,27 @@ public class CalibrationOrderService {
             throw new BizException(buildGateMessage(next, gate));
         }
 
-        if ("CERTIFYING".equals(next)) {
-            if (order.getConclusion() == null || order.getConclusion().isBlank()) {
-                throw new BizException("出证前必须先录入检定结论（合格 / 限用 / 不合格）");
-            }
-            if (order.getCertNo() == null || order.getCertNo().isBlank()) {
-                throw new BizException("出证前必须填写证书编号");
-            }
-            if (order.getCertValidUntil() == null) {
-                order.setCertValidUntil(defaultValidUntil(order));
-            }
+        if ("CALIBRATING".equals(next)) {
+            // 进入检定环节：没有任何原始记录的委托自动建空白草稿（有旧文本/已有版本的不重复建）
+            rawRecordService.ensureDraftOnCalibrating(id);
         }
-        if ("ISSUED".equals(next) && (order.getCertNo() == null || order.getCertNo().isBlank())) {
-            throw new BizException("发放前必须完成出证并填写证书编号");
+        if ("VERIFYING".equals(next)) {
+            // 通用推进按钮不允许跳过「提交复核」：必须先由检定员提交锁定版本
+            throw new BizException("进入核验必须由检定员先「提交复核」锁定原始记录版本，不能直接推进；"
+                    + "请在原始记录面板填写操作人后提交");
+        }
+        if ("CERTIFYING".equals(next)) {
+            throw new BizException("进入出证必须由指派核验员对锁定版本「确认通过」，不能直接推进");
+        }
+        if ("ISSUED".equals(next)) {
+            if (order.getCertNo() == null || order.getCertNo().isBlank()) {
+                throw new BizException("发放前必须完成出证并填写证书编号");
+            }
+            if (order.getCurrentRecordVersionId() == null && order.getMeasuredData() == null) {
+                throw new BizException("发放前必须有核验通过的原始记录版本（或升级前的历史实测数据）");
+            }
+            // 发放瞬间固定证书引用版本；旧文本委托无结构化版本时放行（继续读旧文本）
+            rawRecordService.pinCertVersionOnIssue(id);
         }
         order.setStatus(next);
         order.setUpdatedAt(LocalDateTime.now());
@@ -354,9 +431,12 @@ public class CalibrationOrderService {
     }
 
     /**
-     * 回退一格流转状态（核验打回重检、出证打回核验等）。
-     * 检定中退回收样时标准器尚未真正使用，占用随之释放，检定员可重新选择；
-     * 进入过核验以后再逐级回退（核验→检定中）不释放占用，因为标准器已实际使用。
+     * 回退一格流转状态。
+     * <ul>
+     *   <li>检定中→收样：标准器尚未真正使用，占用随之释放；未提交的草稿作为检定工作产物保留；</li>
+     *   <li>核验→检定中：<b>不走这里</b>，核验员必须写明退回原因（rejectRecord），由系统派生下一版草稿；</li>
+     *   <li>出证→核验：打回重核，当前确认版本退回留痕、派生下一版草稿，回到检定中修订后重走核验。</li>
+     * </ul>
      */
     @Transactional
     public Views.OrderView rollback(Long id) {
@@ -372,6 +452,14 @@ public class CalibrationOrderService {
         if ("ISSUED".equals(order.getStatus())) {
             throw new BizException("已发放的委托单不能回退，如需更正请另开委托单");
         }
+        if ("VERIFYING".equals(order.getStatus())) {
+            throw new BizException("核验环节不能直接回退：核验员只能「确认通过」或「写明原因退回」，"
+                    + "退回后系统会自动生成下一版草稿，旧版本与退回意见全程留痕");
+        }
+        if ("CERTIFYING".equals(order.getStatus())) {
+            throw new BizException("出证环节打回请使用「打回重核」并填写原因（原始记录面板），"
+                    + "系统会把当前确认版本退回并派生下一版草稿");
+        }
         boolean backToReceived = "CALIBRATING".equals(order.getStatus());
         order.setStatus(MetroDict.FLOW_ORDER.get(index - 1));
         order.setUpdatedAt(LocalDateTime.now());
@@ -379,6 +467,22 @@ public class CalibrationOrderService {
         if (backToReceived) {
             orderDeviceService.releaseForRollback(id);
         }
+        return detail(id);
+    }
+
+    /** 出证打回重核：当前确认版本退回留痕、派生下一版草稿、委托回到检定中 */
+    @Transactional
+    public Views.OrderView reopenFromCertifying(Long id, Long versionId, RawRecordDtos.RejectReq req) {
+        rawRecordService.reject(id, versionId, req.getOperator(), req.getReason(),
+                RawRecordService.EV_CERT_REOPEN);
+        CalibrationOrder order = orderRepository.lockById(id)
+                .orElseThrow(() -> new BizException("委托单不存在：id=" + id));
+        if (!"CERTIFYING".equals(order.getStatus())) {
+            throw new BizException("只有出证环节可以打回重核");
+        }
+        order.setStatus("CALIBRATING");
+        order.setUpdatedAt(LocalDateTime.now());
+        orderRepository.save(order);
         return detail(id);
     }
 
@@ -425,16 +529,38 @@ public class CalibrationOrderService {
         return orderRepository.findById(id).orElseThrow(() -> new BizException("委托单不存在：id=" + id));
     }
 
+    /** 批量取「当前确认 / 证书固定」指针版本号：版本 id → 版本号 */
+    private Map<Long, Integer> currentVersionNos(List<CalibrationOrder> orders) {
+        java.util.Set<Long> ids = new java.util.HashSet<>();
+        for (CalibrationOrder o : orders) {
+            if (o.getCurrentRecordVersionId() != null) {
+                ids.add(o.getCurrentRecordVersionId());
+            }
+            if (o.getCertRecordVersionId() != null) {
+                ids.add(o.getCertRecordVersionId());
+            }
+        }
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
+        Map<Long, Integer> map = new HashMap<>();
+        for (RawRecordVersion v : recordVersionRepository.findByIdIn(ids)) {
+            map.put(v.getId(), v.getVersionNo());
+        }
+        return map;
+    }
+
     private Views.OrderView toView(CalibrationOrder order, ViewContext context,
                                    Map<Long, OrderDeviceService.LinkSummary> summaries,
-                                   boolean detail, boolean blocked) {
+                                   boolean detail, boolean blocked,
+                                   Map<Long, Integer> versionNoMap) {
         return toView(order, context,
                 summaries.getOrDefault(order.getId(), new OrderDeviceService.LinkSummary(0, null)),
                 detail,
                 blocked
                         ? new OrderDeviceService.GateCheck(false, false, null, List.of("标准器当前不满足放行条件，详见详情"))
                         : OrderDeviceService.GateCheck.pass(),
-                List.of(), List.of());
+                List.of(), List.of(), null, versionNoMap);
     }
 
     private Views.OrderView toView(CalibrationOrder order, ViewContext context,
@@ -442,7 +568,24 @@ public class CalibrationOrderService {
                                    boolean detail,
                                    OrderDeviceService.GateCheck gate,
                                    List<Views.OrderDeviceView> devices,
-                                   List<Views.DeviceLinkHistoryView> history) {
+                                   List<Views.DeviceLinkHistoryView> history,
+                                   Views.RecordPanelView panel) {
+        Map<Long, Integer> versionNoMap = new HashMap<>();
+        if (order.getCurrentRecordVersionId() != null
+                || order.getCertRecordVersionId() != null) {
+            currentVersionNos(List.of(order)).forEach(versionNoMap::putIfAbsent);
+        }
+        return toView(order, context, summary, detail, gate, devices, history, panel, versionNoMap);
+    }
+
+    private Views.OrderView toView(CalibrationOrder order, ViewContext context,
+                                   OrderDeviceService.LinkSummary summary,
+                                   boolean detail,
+                                   OrderDeviceService.GateCheck gate,
+                                   List<Views.OrderDeviceView> devices,
+                                   List<Views.DeviceLinkHistoryView> history,
+                                   Views.RecordPanelView panel,
+                                   Map<Long, Integer> versionNoMap) {
         Instrument instrument = context.instrumentMap.get(order.getInstrumentId());
         var procedure = context.procedureMap.get(order.getProcedureId());
         boolean voided = MetroDict.STATUS_VOIDED.equals(order.getStatus());
@@ -482,8 +625,15 @@ public class CalibrationOrderService {
                 !gate.passed(),
                 gate.passed() ? List.of() : gate.reasons(),
                 MetroDict.canEditDevices(order.getStatus()),
+                order.getCurrentRecordVersionId() == null ? null
+                        : versionNoMap.get(order.getCurrentRecordVersionId()),
+                order.getCertRecordVersionId() == null ? null
+                        : versionNoMap.get(order.getCertRecordVersionId()),
+                order.getCurrentRecordVersionId() == null
+                        && blankToNull(order.getMeasuredData()) != null,
                 detail ? devices : null,
-                detail ? history : null);
+                detail ? history : null,
+                detail ? panel : null);
     }
 
     /** 一次取全，避免逐条查询 */
